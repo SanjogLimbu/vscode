@@ -1,0 +1,220 @@
+name: Selection check
+
+on:
+  push:
+    branches:
+      - ci/cross-platform-selection-test
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-24.04
+            arch: x64
+          - name: macOS
+            runner: macos-15
+            arch: arm64
+    env:
+      VSCODE_ARCH: ${{ matrix.arch }}
+      NPM_ARCH: ${{ matrix.arch }}
+      BASE_COMMIT: 817607ae52b88ef6021bb456e5995b6367e1b481
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Install system packages
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/install-linux-packages
+
+      - name: Setup Linux display and clipboard
+        if: runner.os == 'Linux'
+        run: |
+          set -e
+          sudo apt-get install -y xclip
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo cp build/azure-pipelines/linux/xvfb.init /etc/init.d/xvfb
+          sudo chmod +x /etc/init.d/xvfb
+          sudo update-rc.d xvfb defaults
+          sudo service xvfb start
+
+      - name: Workaround expat NULL deref CVEs in fontconfig parsing
+        if: runner.os == 'Linux'
+        run: |
+          set -e
+          # Ubuntu 24.04 ships expat 2.6.1 which has multiple NULL dereference
+          # CVEs triggered when fontconfig parses <include> directives via
+          # expat's XML_ExternalEntityParserCreate:
+          #   CVE-2026-24515 (backported but crash persists)
+          #   CVE-2026-32776 (not yet backported) - empty external parameter entities
+          #   CVE-2026-32778 (not yet backported) - setContext after OOM
+          # All three are fixed upstream in expat >= 2.7.5.
+          # Check if the runner already has the fix — skip workaround if so.
+          EXPAT_VER=$(dpkg-query -W -f='${Version}' libexpat1 2>/dev/null || echo "0")
+          if dpkg --compare-versions "$EXPAT_VER" ge "2.7.5"; then
+            echo "::warning::libexpat1 $EXPAT_VER includes all CVE fixes (>= 2.7.5). The fontconfig workaround in this workflow can be removed."
+            exit 0
+          fi
+          echo "Installed expat: $EXPAT_VER — applying fontconfig workaround"
+          # Workaround: use a minimal fontconfig config with no <include> directives,
+          # avoiding the external entity parser codepath entirely. Based on upstream
+          # fontconfig 2.15.0 fonts.conf.in with <include> removed, generic family
+          # aliases inlined, and default font mappings for generic families added
+          # (from conf.d/49-sansserif.conf and DejaVu font configs).
+          # Remove once Ubuntu backports the remaining CVE fixes.
+          cat > /tmp/fonts-minimal.conf << 'FONTCONFIG_EOF'
+          <?xml version="1.0"?>
+          <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+          <fontconfig>
+            <dir>/usr/share/fonts</dir>
+            <dir>/usr/local/share/fonts</dir>
+            <dir prefix="xdg">fonts</dir>
+            <cachedir>/var/cache/fontconfig</cachedir>
+            <cachedir prefix="xdg">fontconfig</cachedir>
+            <!-- Generic family aliases from upstream fonts.conf -->
+            <match target="pattern">
+              <test qual="any" name="family"><string>mono</string></test>
+              <edit name="family" mode="assign" binding="same"><string>monospace</string></edit>
+            </match>
+            <match target="pattern">
+              <test qual="any" name="family"><string>sans serif</string></test>
+              <edit name="family" mode="assign" binding="same"><string>sans-serif</string></edit>
+            </match>
+            <match target="pattern">
+              <test qual="any" name="family"><string>sans</string></test>
+              <edit name="family" mode="assign" binding="same"><string>sans-serif</string></edit>
+            </match>
+            <match target="pattern">
+              <test qual="any" name="family"><string>system ui</string></test>
+              <edit name="family" mode="assign" binding="same"><string>system-ui</string></edit>
+            </match>
+            <!-- Map generic families to actual fonts (from conf.d/49-sansserif, 57-dejavu) -->
+            <alias>
+              <family>monospace</family>
+              <prefer><family>DejaVu Sans Mono</family></prefer>
+            </alias>
+            <alias>
+              <family>sans-serif</family>
+              <prefer><family>DejaVu Sans</family></prefer>
+            </alias>
+            <alias>
+              <family>serif</family>
+              <prefer><family>DejaVu Serif</family></prefer>
+            </alias>
+            <!-- Fallback: assign sans-serif to unmatched families (from 49-sansserif.conf) -->
+            <match target="pattern">
+              <test qual="all" name="family" compare="not_eq"><string>sans-serif</string></test>
+              <test qual="all" name="family" compare="not_eq"><string>serif</string></test>
+              <test qual="all" name="family" compare="not_eq"><string>monospace</string></test>
+              <edit name="family" mode="append_last"><string>sans-serif</string></edit>
+            </match>
+            <!-- Rendering defaults -->
+            <match target="font">
+              <edit name="antialias" mode="assign"><bool>true</bool></edit>
+              <edit name="hinting" mode="assign"><bool>true</bool></edit>
+              <edit name="hintstyle" mode="assign"><const>hintslight</const></edit>
+            </match>
+            <config>
+              <rescan><int>0</int></rescan>
+            </config>
+          </fontconfig>
+          FONTCONFIG_EOF
+          echo "FONTCONFIG_FILE=/tmp/fonts-minimal.conf" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        working-directory: build
+        run: pnpm install --frozen-lockfile
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -e
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            source ./build/azure-pipelines/linux/setup-env.sh
+          else
+            python3 -m pip install --break-system-packages setuptools
+          fi
+          for i in {1..5}; do
+            pnpm install --frozen-lockfile && break
+            if [ $i -eq 5 ]; then
+              exit 1
+            fi
+          done
+        env:
+          npm_config_arch: ${{ matrix.arch }}
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GYP_DEFINES: ${{ runner.os == 'macOS' && 'kerberos_use_rtld=false' || '' }}
+
+      - name: Download Electron and built-in extensions
+        run: |
+          set -e
+          mkdir -p .build
+          node build/lib/electron.ts
+          node build/lib/builtInExtensions.ts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build with the fix
+        run: pnpm run build-fast
+
+      - name: Test with the fix
+        id: with-fix
+        continue-on-error: true
+        timeout-minutes: 20
+        run: bash .github/selection-check/run.sh after
+
+      - name: Build without the fix
+        run: |
+          set -e
+          git checkout "$BASE_COMMIT" --             src/vs/base/browser/ui/list/listView.ts             src/vs/base/browser/ui/list/listWidget.ts             src/vs/base/browser/ui/tree/abstractTree.ts             src/vs/base/browser/ui/tree/asyncDataTree.ts             src/vs/workbench/contrib/debug/browser/repl.ts
+          pnpm run build-fast --client-only
+
+      - name: Test without the fix
+        id: without-fix
+        continue-on-error: true
+        timeout-minutes: 20
+        run: bash .github/selection-check/run.sh before
+
+      - name: Report results
+        if: always()
+        run: |
+          for f in selection-check-results/*.json; do
+            echo "=== $f"
+            cat "$f"
+            echo
+            { echo "### $f"; echo '```json'; cat "$f"; echo; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: selection-check-${{ matrix.name }}
+          path: selection-check-results
+          if-no-files-found: warn
+
+      - name: Fail if the fix did not pass
+        if: steps.with-fix.outcome != 'success'
+        run: exit 1
