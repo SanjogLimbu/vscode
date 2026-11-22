@@ -52,4 +52,10 @@ node "$ROOT/.github/selection-check/driver.cjs" "$VARIANT" "$OUT/$VARIANT.json"
 CODE=$?
 
 pkill -f "remote-debugging-port=9333" || true
+for _ in $(seq 1 30); do
+	curl -s --max-time 1 http://127.0.0.1:9333/json/version > /dev/null || break
+	sleep 1
+done
+pkill -9 -f "remote-debugging-port=9333" || true
+sleep 2
 exit $CODE

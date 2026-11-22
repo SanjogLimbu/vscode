@@ -26,6 +26,15 @@ const readClipboard = () => isMac
 	: execFileSync('xclip', ['-selection', 'clipboard', '-o'], clipboardOptions);
 const clearClipboard = () => execFileSync(isMac ? 'pbcopy' : 'xclip', isMac ? [] : ['-selection', 'clipboard', '-i'], { input: 'sentinel', stdio: ['pipe', 'ignore', 'ignore'], timeout: 5000 });
 
+async function waitForClipboardChange() {
+	let text = readClipboard();
+	for (let attempt = 0; attempt < 12 && text === 'sentinel'; attempt++) {
+		await new Promise(resolve => setTimeout(resolve, 500));
+		text = readClipboard();
+	}
+	return text;
+}
+
 function summarize(text) {
 	const numbers = text.split(/\r?\n/).map(line => line.trim().match(/^\d+/)?.[0]).filter(value => value !== undefined).map(Number);
 	let gaps = 0;
@@ -49,7 +58,7 @@ async function findWorkbench(browser) {
 }
 
 async function main() {
-	const browser = await chromium.connectOverCDP('http://127.0.0.1:9333');
+	const browser = await chromium.connectOverCDP('http://127.0.0.1:9333', { timeout: 120000 });
 	const page = await findWorkbench(browser);
 	const screenshot = name => page.screenshot({ path: outFile.replace(/\.json$/, `-${name}.png`), timeout: 60000 }).catch(() => undefined);
 	await page.waitForSelector('.monaco-workbench .part.editor', { timeout: 180000 });
@@ -187,10 +196,24 @@ async function main() {
 	const copyItem = page.locator('.context-view .monaco-menu .action-label:visible', { hasText: /^Copy$/ }).first();
 	if (await copyItem.count()) {
 		await copyItem.click();
-		await page.waitForTimeout(1000);
-		result.menuCopy = summarize(readClipboard());
+		result.menuCopy = summarize(await waitForClipboardChange());
+		result.menuClosedAfterCopy = !(await page.locator('.context-view .monaco-menu').first().isVisible().catch(() => false));
 	} else {
 		result.menuCopy = 'menu item not found';
+	}
+	result.selectionAfterMenuCopy = await page.evaluate(() => getSelection().toString().length);
+
+	// Copy All uses the same clipboard service but no selection code, so it shows whether this machine can observe it.
+	clearClipboard();
+	await page.mouse.click(textBox.x + 20, middle[Math.floor(middle.length / 2)].y, { button: 'right' });
+	await page.waitForTimeout(800);
+	const copyAllItem = page.locator('.context-view .monaco-menu .action-label:visible', { hasText: /^Copy All$/ }).first();
+	if (await copyAllItem.count()) {
+		await copyAllItem.click();
+		const text = await waitForClipboardChange();
+		result.copyAllControl = { clipboardChanged: text !== 'sentinel', ...summarize(text) };
+	} else {
+		result.copyAllControl = 'menu item not found';
 	}
 
 	const rowLimit = result.rowsWithoutSelection + 4;
